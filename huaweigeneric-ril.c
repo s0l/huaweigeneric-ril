@@ -2057,9 +2057,10 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 	LOGD("execute pppd: %s", cmd_buf);
 
 	if (system(cmd_buf) < 0) {
+		free(cmd_buf);
 		goto error;
 	}
-
+	free(cmd_buf);
 	LOGD("pppd executed");
 
 	sleep(2); // Allow time for ip-up to complete
