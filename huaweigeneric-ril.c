@@ -21,6 +21,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -78,6 +79,61 @@ static void freeCardStatus(RIL_CardStatus *p_card_status);
 static void onDataCallListChanged(void *param);
 static int killConn(char * cid);
 
+static char ttyUSB0s[128]; // AT commands
+static char ttyUSB1s[128]; // CTL tty
+
+static int ttyUSB0;
+static int ttyUSB1;
+
+static int ttyUSBlist[8]; // 0 - at command, 1 - ctl, 2 - ?, 3 - ?...
+
+  #ifndef max
+    #define max(a,b) (((a) > (b)) ? (a) : (b))
+  #endif
+  #ifndef min
+    #define min(a,b) (((a) < (b)) ? (a) : (b))
+  #endif
+
+static int ttyUSBreinit() {
+
+	int minUSB = 255;
+	int maxUSB = 0;
+	int i = 0;
+	char* buf = (char*)alloca(128);
+	int idxpos = 0;
+
+	for(; i <= 255; ++i) {
+		
+		sprintf(buf, "/dev/ttyUSB%d", i);
+
+		if (0 == access(buf, R_OK)) {
+			ttyUSBlist[idxpos++] = i;
+			if (idxpos > 7)
+				break;
+		}
+		
+	}
+
+        if (idxpos < 2) {
+		LOGD("[err] no modem found");
+		return -1;
+	}
+
+	ttyUSB0 = ttyUSBlist[0];
+	ttyUSB1 = ttyUSBlist[idxpos-1]; // last modem is ctl
+
+	sprintf(ttyUSB0s, "/dev/ttyUSB%d", ttyUSB0);
+	sprintf(ttyUSB1s, "/dev/ttyUSB%d", ttyUSB1);
+
+	LOGD("[inf] AT_MODEM device: %s, CTL_MODEM device: %s", ttyUSB0s, ttyUSB1s);
+
+	return 0;
+}
+
+static void killpppd() {
+	system("/system/bin/killpppd");
+	sleep(1);
+}
 
 extern const char * requestToString(int request);
 
@@ -614,6 +670,7 @@ static void requestOrSendDataCallList(RIL_Token *t)
 	}
 
     // make sure pppd is still running, invalidate datacall if it isn't
+/*
 	if ((fd = open("/etc/ppp/ppp-gprs.pid",O_RDONLY)) > 0)
     {
 		close(fd);
@@ -622,7 +679,7 @@ static void requestOrSendDataCallList(RIL_Token *t)
 	{
 		responses[0].active = 0;
 	}
-
+*/
 	if (t != NULL)
 		RIL_onRequestComplete(*t, RIL_E_SUCCESS, responses,
 				n * sizeof(RIL_Data_Call_Response));
@@ -1905,11 +1962,14 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 		// Hangup anything that's happening there now
 		err = at_send_command("AT+CGACT=0,1", NULL);
 		// Start data on PDP context 1
-		err = at_send_command("ATD*99***1#", &p_response);
+		err = at_send_command("ATD*99***1#", &p_response);		
 		if (err < 0 || p_response->success == 0) {
-			at_response_free(p_response);
-			goto error;
+			LOGD("err: %d, ATR: success=%d, msg: %s", err, p_response->success, p_response->finalResponse ? p_response->finalResponse : "NULL");
+			// at_response_free(p_response);
+			// goto error; // no, try pppd, becouse NO CARRIER mean we already connected
 		}
+		
+		LOGD("success: %d, ATR: success=%d, msg: %s", err, p_response->success, p_response->finalResponse ? p_response->finalResponse : "NULL");
 		at_response_free(p_response);
 		sleep(2); //Wait for the modem to finish
 	} else {
@@ -1924,6 +1984,10 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 		sleep(2); //Wait for the modem to finish
 	}
 
+	LOGD("ok, connected");
+
+	ttyUSBreinit();
+
 	//set up the pap/chap secrets file
 	sprintf(userpass, "%s * %s", user, pass);
 	if (0 != strcmp(userpass, userPassStatic))
@@ -1931,19 +1995,25 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 		strcpy (userPassStatic, userpass);
 		len = strlen(userpass);
 		fd = open("/etc/ppp/pap-secrets",O_WRONLY);
-		if(fd < 0)
+		if(fd < 0) {
+			LOGD("err: unable to open /etc/ppp/pap-secrets to rw");
 			goto error;
+		}
 		write(fd, userpass, len);
 		close(fd);
 		fd = open("/etc/ppp/chap-secrets",O_WRONLY);
-		if(fd < 0)
+		if(fd < 0) {
+			LOGD("err: unable to open /etc/ppp/chap-secrets to rw");
 			goto error;
+		}
 		write(fd, userpass, len);
 		close(fd);
 
 		pppconfig = fopen("/etc/ppp/options.huawei","r");
-		if(!pppconfig)
+		if(!pppconfig) {
+			LOGD("err: unable to open /etc/ppp/options.huawei to read");
 			goto error;
+		}
 
 		//filesize
 		fseek(pppconfig, 0, SEEK_END);
@@ -1952,24 +2022,45 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 
 		//allocate memory
 		buffer = (char *) malloc (sizeof(char)*buffSize);
-		if (buffer == NULL)
+		if (buffer == NULL) {
+			LOGD("err: unable to allocate %d bytes", (int)(sizeof(char)*buffSize));
 			goto error;
+		}
 
 		//read in the original file
 		len = fread (buffer,1,buffSize,pppconfig);
-		if (len != buffSize)
+		if (len != buffSize) {
+			LOGD("err: len(%d) != buffSize(%d)", (int)len, (int)buffSize);
 			goto error;
+		}
 		fclose(pppconfig);
 
-		pppconfig = fopen("/etc/ppp/options.ttyUSB0","w");
+		char* opt_buf_name = (char*)malloc(256);
+		sprintf(opt_buf_name, "/etc/ppp/options.ttyUSB%d", ttyUSB0);
+
+		pppconfig = fopen(opt_buf_name,"w");
+		if (!pppconfig) {
+			free(buffer);
+			LOGD("err: unable to open %s to write", opt_buf_name);
+		}
 		fwrite(buffer,1,buffSize,pppconfig);
 		fprintf(pppconfig,"name %s\n",user);
 		fclose(pppconfig);
 		free(buffer);
+		free(opt_buf_name);
 	}
 
-	if (system("/system/bin/pppd /dev/ttyUSB0") < 0)
+	char * cmd_buf = (char*)malloc(1024);
+
+	sprintf(cmd_buf, "/system/bin/pppd /dev/ttyUSB%d file /etc/ppp/options.ttyUSB%d", ttyUSB0, ttyUSB0);
+
+	LOGD("execute pppd: %s", cmd_buf);
+
+	if (system(cmd_buf) < 0) {
 		goto error;
+	}
+
+	LOGD("pppd executed");
 
 	sleep(2); // Allow time for ip-up to complete
 
@@ -1992,6 +2083,8 @@ static int killConn(char * cid)
 
 	LOGD("killConn");
 
+	killpppd();
+/*
     while ((fd = open("/etc/ppp/ppp-gprs.pid",O_RDONLY)) > 0)
     {
         if(i%5 == 0)
@@ -2002,7 +2095,7 @@ static int killConn(char * cid)
 		close(fd);
         sleep(1);
     }
-
+*/
     LOGD("killall pppd finished");
 
     if (isgsm) {
@@ -4475,16 +4568,19 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
 static void onATReaderClosed()
 {
 	LOGI("AT channel closed\n");
+	killpppd();
 	at_close();
 	s_closed = 1;
 
 	setRadioState (RADIO_STATE_UNAVAILABLE);
+
 }
 
 /* Called on command thread */
 static void onATTimeout()
 {
 	LOGI("AT channel timeout; closing\n");
+	killpppd();
 	at_close();
 
 	s_closed = 1;
@@ -4591,7 +4687,16 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
 				break;
 
 			case 'd':
-				s_device_path = "/dev/ttyUSB2";
+				//s_device_path = "/dev/ttyUSB2";
+				s_device_path = ttyUSB1s; // autogenerated
+				while(1) {
+					if (ttyUSBreinit()) {
+						LOGI("[inf] wait for modem...");
+						sleep(5);
+						continue;
+					}
+					break;
+				}
 				LOGI("Opening tty device %s\n", s_device_path);
 				break;
 
@@ -4636,7 +4741,9 @@ int main (int argc, char **argv)
 				break;
 
 			case 'd':
-				s_device_path = "/dev/ttyUSB2";
+				//s_device_path = "/dev/ttyUSB2";
+				s_device_path = ttyUSB1s; // autogenerated
+				ttyUSBreinit();
 				LOGI("Opening tty device %s\n", s_device_path);
 				break;
 
